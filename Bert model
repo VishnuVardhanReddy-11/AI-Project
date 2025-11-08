@@ -1,0 +1,327 @@
+"""
+ai_web_content_classifier.py
+
+Single-file pipeline:
+- fetch URL(s)
+- extract article text
+- chunk into lines/paragraphs
+- embed with BERT
+- build category vectors from seed phrases
+- classify by cosine similarity
+- produce explainability: top contributing lines
+- optionally call OpenAI to render a polished explanation
+
+Requirements:
+pip install transformers torch requests beautifulsoup4 sklearn openai
+(If GPU available, transformers + torch will use it automatically)
+
+Author: Sakthi (adapted)
+"""
+
+import os
+import math
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict, Tuple
+import numpy as np
+
+# Transformers / Torch
+import torch
+from transformers import BertTokenizer, BertModel
+
+# Utilities
+from sklearn.metrics.pairwise import cosine_similarity
+import openai  # optional; used only if OPENAI_API_KEY provided
+
+# -------- CONFIG --------
+BERT_MODEL_NAME = "bert-base-uncased"  # 768-dim embeddings
+MAX_LINES_PER_CHUNK = 1  # use 1 to treat each line separately; set >1 to group lines
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Eight target categories and short seed phrases to define each category vector
+CATEGORIES = {
+    "Sports": [
+        "match results, team, tournament, player, coach, score, goal, win, loss, league",
+        "athlete performance, training, sports competition, stadium coverage"
+    ],
+    "Business & Economy": [
+        "market trends, stock prices, economy, business strategy, companies, investment",
+        "mergers, revenue, financial quarter, economic policy, startups"
+    ],
+    "Educational": [
+        "university, course, curriculum, study, lecture, academic research, student",
+        "learning resources, exams, educational policy"
+    ],
+    "News": [
+        "breaking news, report, journalist, press release, local news, global headlines",
+        "current events, statements, official announcement"
+    ],
+    "Science & Technology": [
+        "research, experiment, AI, machine learning, engineering, scientific discovery",
+        "technology product, software, hardware, innovation"
+    ],
+    "Environment & Climate": [
+        "climate change, sustainability, pollution, ecosystem, environmental policy",
+        "conservation, weather events, emissions, renewable energy"
+    ],
+    "Arts": [
+        "painting, sculpture, exhibition, gallery, artist, creative process",
+        "visual arts, performance, critique, art festival"
+    ],
+    "Culture & Lifestyle": [
+        "culture, lifestyle, travel, food, fashion, social trends, human interest",
+        "culture events, daily life, hobbies"
+    ]
+}
+
+# -------- UTILS: Scraping & Text Processing --------
+def fetch_url_text(url: str, max_chars: int = 20000) -> str:
+    """
+    Fetches the main textual content from a URL using BeautifulSoup.
+    Returns concatenated paragraphs. Truncates at max_chars to keep processing reasonable.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (ai-web-content-classifier)"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Remove scripts/styles
+    for tag in soup(["script", "style", "noscript", "iframe", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    # Grab common paragraph tags
+    paragraphs = []
+    for p in soup.find_all(["p", "article", "div"]):
+        text = p.get_text(separator=" ", strip=True)
+        if text and len(text.split()) > 3:
+            paragraphs.append(text)
+    # If paragraphs collection is empty fallback to body text
+    if not paragraphs:
+        body = soup.get_text(separator=" ", strip=True)
+        paragraphs = [body]
+
+    full_text = "\n".join(paragraphs)
+    return full_text[:max_chars]
+
+def chunk_lines(text: str, lines_per_chunk: int = 1) -> List[str]:
+    """
+    Split text into lines (by newline), or if none, split into sentence-like chunks.
+    Group lines_per_chunk together to make chunk context richer.
+    """
+    raw_lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    if not raw_lines:
+        # fallback: naive split by sentences
+        raw_lines = [s.strip() for s in text.replace("  ", " ").split(". ") if s.strip()]
+    chunks = []
+    for i in range(0, len(raw_lines), lines_per_chunk):
+        chunk = " ".join(raw_lines[i:i+lines_per_chunk])
+        chunks.append(chunk)
+    return chunks
+
+# -------- UTILS: BERT Embeddings --------
+class BertEmbedder:
+    def __init__(self, model_name: str = BERT_MODEL_NAME, device: torch.device = DEVICE):
+        print(f"[INFO] Loading BERT model '{model_name}' on {device}")
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+        self.model = BertModel.from_pretrained(model_name, output_attentions=False)
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+
+    def embed_texts(self, texts: List[str], batch_size: int = 8) -> np.ndarray:
+        """
+        Returns numpy array (n_texts, hidden_size) of CLS embeddings
+        """
+        all_embeds = []
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i+batch_size]
+                enc = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                enc = {k: v.to(self.device) for k, v in enc.items()}
+                out = self.model(**enc)
+                cls_emb = out.last_hidden_state[:, 0, :].detach().cpu().numpy()  # (batch, hidden)
+                all_embeds.append(cls_emb)
+        return np.vstack(all_embeds)
+
+# -------- CATEGORY VECTORS (seed-based) --------
+def build_category_vectors(embedder: BertEmbedder, category_seeds: Dict[str, List[str]]) -> Dict[str, np.ndarray]:
+    """
+    For each category, embed its seed phrases and average to create a category vector.
+    """
+    category_vectors = {}
+    for cat, seeds in category_seeds.items():
+        seed_embeds = embedder.embed_texts(seeds)
+        cat_vec = seed_embeds.mean(axis=0)
+        category_vectors[cat] = cat_vec / (np.linalg.norm(cat_vec) + 1e-9)
+    return category_vectors
+
+# -------- CLASSIFICATION & EXPLAINABILITY --------
+def classify_article_chunks(
+    chunk_texts: List[str],
+    embedder: BertEmbedder,
+    category_vectors: Dict[str, np.ndarray]
+) -> Tuple[str, Dict[str, float], List[Tuple[int, str, float]]]:
+    """
+    - Embeds chunks
+    - Computes cosine similarity of each chunk to each category vector
+    - Aggregates chunk-level similarities to a document-level score per category (mean)
+    - Picks best category
+    Returns:
+        predicted_category,
+        doc_scores (category -> score),
+        top_contributing_chunks: list of (chunk_index, text, contribution_score) sorted desc
+    """
+    chunk_embeds = embedder.embed_texts(chunk_texts)  # shape (n_chunks, D)
+    # normalize
+    norms = np.linalg.norm(chunk_embeds, axis=1, keepdims=True) + 1e-9
+    chunk_embeds_norm = chunk_embeds / norms
+
+    # build matrix of category vectors
+    cats = list(category_vectors.keys())
+    cat_matrix = np.vstack([category_vectors[c] for c in cats])  # (n_cats, D)
+
+    # per-chunk similarity: (n_chunks, n_cats)
+    sim = chunk_embeds_norm.dot(cat_matrix.T)
+
+    # aggregate doc-level by averaging chunk similarities across chunks (axis=0)
+    doc_scores_arr = sim.mean(axis=0)  # (n_cats,)
+    doc_scores = {cats[i]: float(doc_scores_arr[i]) for i in range(len(cats))}
+
+    # predicted category
+    predicted_category = max(doc_scores.items(), key=lambda x: x[1])[0]
+
+    # For explainability: compute each chunk's contribution to predicted category
+    pred_idx = cats.index(predicted_category)
+    chunk_contributions = [(i, chunk_texts[i], float(sim[i, pred_idx])) for i in range(len(chunk_texts))]
+    # Sort chunks by contribution descending
+    chunk_contributions.sort(key=lambda x: x[2], reverse=True)
+
+    return predicted_category, doc_scores, chunk_contributions
+
+# -------- LLM-based explanation (optional) --------
+def generate_llm_explanation(
+    article: str,
+    predicted_category: str,
+    top_chunks: List[Tuple[int, str, float]],
+    doc_scores: Dict[str, float],
+    openai_api_key: str = None,
+    model_name: str = "gpt-4o-mini"  # replace with whichever model you'd like/are billed for
+) -> str:
+    """
+    If openai_api_key provided, calls OpenAI to get a polished explanation.
+    Otherwise returns a structured templated explanation.
+    """
+    evidence = []
+    for i, text, score in top_chunks[:6]:
+        evidence.append(f"Line #{i+1} (score={score:.3f}): {text[:260]}")
+
+    prompt = (
+        f"You are an explainable AI assistant. An article was categorized as '{predicted_category}'.\n\n"
+        f"Article (truncated to 3000 chars):\n{article[:3000]}\n\n"
+        f"Predicted Category: {predicted_category}\n\n"
+        f"Category Scores (top 5):\n"
+        + "\n".join([f"{k}: {v:.4f}" for k, v in sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)[:5]])
+        + "\n\n"
+        f"Top contributing lines:\n" + "\n".join(evidence)
+        + "\n\nTask: Write a concise (120-220 word) explanation that:\n"
+        "- Summarizes why the article fits the predicted category\n"
+        "- References the most influential lines/tokens as evidence\n"
+        "- Mentions uncertainty or close competing categories if applicable\n"
+        "\n\nWrite the explanation now."
+    )
+
+    if openai_api_key:
+        openai.api_key = openai_api_key
+        response = openai.ChatCompletion.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.0
+        )
+        text = response["choices"][0]["message"]["content"].strip()
+        return text
+    else:
+        # Local templated explanation
+        top_lines = "\n".join([f"- {t[:200]} (score {s:.3f})" for (_, t, s) in top_chunks[:5]])
+        competing = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        comp_text = ", ".join([f"{k} ({v:.3f})" for k, v in competing if k != predicted_category])
+        template = (
+            f"Predicted Category: {predicted_category}\n\n"
+            f"Summary: The article discusses topics that align closely with the '{predicted_category}' domain. "
+            f"The most influential excerpts include:\n{top_lines}\n\n"
+            f"Evidence & Rationale: The model's semantic embeddings show higher similarity to {predicted_category} seed concepts "
+            f"than to other categories (nearest competitors: {comp_text}).\n\n"
+            f"Confidence: {doc_scores[predicted_category]:.3f} (relative similarity score)."
+        )
+        return template
+
+# -------- MAIN PIPELINE FUNCTION --------
+def analyze_url(
+    url: str,
+    embedder: BertEmbedder,
+    category_vectors: Dict[str, np.ndarray],
+    openai_api_key: str = None,
+    lines_per_chunk: int = MAX_LINES_PER_CHUNK
+) -> Dict:
+    """
+    Runs the full pipeline for a single URL and returns structured result.
+    """
+    print(f"[INFO] Fetching URL: {url}")
+    try:
+        full_text = fetch_url_text(url)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch URL {url}: {e}")
+
+    chunks = chunk_lines(full_text, lines_per_chunk)
+    if not chunks:
+        raise RuntimeError("No textual content extracted from URL.")
+
+    predicted_category, doc_scores, chunk_contribs = classify_article_chunks(chunks, embedder, category_vectors)
+
+    explanation = generate_llm_explanation(full_text, predicted_category, chunk_contribs, doc_scores, openai_api_key)
+
+    # Build result
+    result = {
+        "url": url,
+        "predicted_category": predicted_category,
+        "category_scores": doc_scores,
+        "top_chunks": [{"index": i, "text": t, "score": s} for (i, t, s) in chunk_contribs[:8]],
+        "explanation": explanation,
+        "raw_text_snippet": full_text[:3000]
+    }
+    return result
+
+# -------- SAMPLE USAGE (if run as script) --------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="AI Web Content Classifier (seed-vector BERT approach)")
+    parser.add_argument("--urls", nargs="+", help="One or more URLs to analyze", required=True)
+    parser.add_argument("--openai_key", help="Optional OpenAI API key to generate polished explanations")
+    parser.add_argument("--lines_per_chunk", type=int, default=1, help="Group N lines as a chunk for embedding")
+    args = parser.parse_args()
+
+    # Initialize embedder and categories
+    emb = BertEmbedder()
+    cat_vecs = build_category_vectors(emb, CATEGORIES)
+
+    # Run analysis for each URL
+    results = []
+    for u in args.urls:
+        try:
+            res = analyze_url(u, emb, cat_vecs, openai_api_key=args.openai_key, lines_per_chunk=args.lines_per_chunk)
+            results.append(res)
+            # Print concise summary
+            print("\n" + "="*80)
+            print(f"URL: {res['url']}")
+            print(f"Predicted Category: {res['predicted_category']}")
+            print("Top category scores:")
+            for k, v in sorted(res['category_scores'].items(), key=lambda x: x[1], reverse=True)[:5]:
+                print(f"  {k}: {v:.4f}")
+            print("Top contributing chunks:")
+            for tc in res["top_chunks"][:5]:
+                print(f"  ({tc['index']}) score={tc['score']:.3f} snippet={tc['text'][:140]}...")
+            print("\nExplanation:\n")
+            print(res["explanation"])
+            print("="*80 + "\n")
+        except Exception as e:
+            print(f"[ERROR] Failed analyzing {u}: {e}")
