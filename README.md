@@ -35,16 +35,22 @@ The backend runs locally on **Flask** and serves results instantly to your Chrom
 ```bash
 git clone https://github.com/yourusername/multimodal-analyzer.git
 cd multimodal-analyzer
+```
 ### 2️⃣** Setup Environment**
+```bash
 python -m venv venv
 .\venv\Scripts\activate     # On Windows
 # or
 source venv/bin/activate    # On Linux/Mac
-3️⃣ Install Dependencies
+```
+###3️⃣ **Install Dependencies**
+```bash
 pip install flask torch torchvision torchaudio tensorflow transformers pillow scikit-learn cloudscr
-4️⃣ Run the Flask API
+```
+###4️⃣ ***Run the Flask API***
+```bash
 python api_server.py
-
+```
 
 Chrome Extension Setup
 
@@ -65,7 +71,7 @@ multimodal_extension/
 Open the popup → Click “Analyze Current Page”
 
 
-🧠 Models Used
+###🧠 ***Models Used***
 Model	Purpose
 BERT	Text Embedding
 DistilBERT	Sentiment Detection
@@ -73,7 +79,7 @@ ResNet50	Image Embedding
 TF-IDF	Keyword Extraction
 
 
-🛠 Libraries Used
+###🛠 ***Libraries Used***
 flask
 torch
 torchvision
@@ -87,7 +93,7 @@ beautifulsoup4
 requests
 numpy
 
-👨‍💻 Authors
+###👨‍💻 ***Authors***
 
 👤 Balanagu Krishna Kiriti
 👤 Kethamreddy Vishnu Vardhan Reddy
@@ -95,7 +101,7 @@ numpy
 👤 Pratyush Kumar V
 👤 Shakti Narayan
 
-🌟 Future Enhancements
+###🌟 ***Future Enhancements***
 
 Real-time browser sentiment overlay
 
