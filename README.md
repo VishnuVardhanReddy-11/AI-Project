@@ -95,10 +95,10 @@ numpy
 
 👨‍💻 ***Authors***
 
-👤 Balanagu Krishna Kiriti
 👤 Kethamreddy Vishnu Vardhan Reddy
 👤 Koteru Tarun
 👤 Pratyush Kumar V
+👤 Balanagu Krishna Kiriti
 👤 Shakti Narayan
 
 🌟 ***Future Enhancements***
